@@ -3,8 +3,11 @@
 
 help=false
 skip_install=false
-output_dir="."
+keep_data=false
+output_dir=$(pwd)
+
 clear
+
 echo "This program runs under following license:"
 echo ""	
 echo ""
@@ -37,6 +40,8 @@ do
 		help=true
 	elif [ "$option" == "-s" ] || [ "$option" == "-skip_install" ]; then
 		skip_install=true
+	elif [ "$option" == "-k" ] || [ "$option" == "-keep_data" ]; then
+		keep_data=true 
 	elif [ 	$( echo "$option" |cut -d '=' -f1 ) == "-output_dir" ]; then
 		output_dir=$( echo "$option" |cut -d '=' -f2 )
 		if [ ! -d "$output_dir" ]; then 
@@ -60,7 +65,8 @@ if [ "$help" == true ]; then
 	echo 'Options:'
 	echo '-------------------'
 	echo '-skip_install, -s: 			Skip automatic installation of requirements'
-	echo '-output_dir=<path>: 			Write output files (RDF Files, Logs, control files) to <path>'zzz
+	echo '-keep_everything, -k:			Keep intermediate .csv Datasets.'
+	echo '-output_dir=<path>:			Write output files (RDF Files, Logs, control files) to <path>'
 	echo '-------------------'
 	echo -e '-h , -help:				Print help file'
 else
@@ -288,31 +294,74 @@ else
 		fi
 		# Start processing if last processing did not suceeded
 		if [  -f "$str_folder_name/SG_DOWNLOAD_DONE" ] && [ ! -f "$str_folder_name/SG_PROCESSING_DONE" ]; then
-			timestamp=`date "+%Y_%m_%d_%H_%M_%S"`
-			echo "$timestamp --- Call: ./processing.sh  $str_folder_name $str_file_name" >> $log
-			./processing.sh "$str_folder_name" "$str_file_name"
-		fi
-	fi
-		# Clean the mess up.
-	if [ -f "$str_folder_name/SG_PROCESSING_DONE" ]; then
-		count_active_dumps=$[$count_active_dumps +1]
-			timestamp=`date "+%Y_%m_%d_%H_%M_%S"`
-		echo "$timestamp --- File: $str_folder_name/$str_file_name processed" >> $log
-		if [ -f "$str_folder_name/$str_file_name" ]; then
-			timestamp=`date "+%Y_%m_%d_%H_%M_%S"`
-			rm -type f $str_folder_name/$str_file_name
-			echo "$timestamp --- File: removing .tar.gz" >> $log
-		fi
-		if [ "$count_active_dumps" == "1" ]; then
-			echo "$str_folder_name/$str_folder_name/rdf/combined.ttl" > "SG_RECENT_DUMP"
-		fi
-		if [ "$count_active_dumps" -ge "$max_active_dumps" ]; then
-			find "$str_folder_name/" -name "combined.ttl" -type f -delete
-		cd $str_folder_name
-			find "." -type d -delete >> /dev/null
-			cd ../
-			timestamp=`date "+%Y_%m_%d_%H_%M_%S"`
-			echo "$timestamp --- Folder: removing $str_folder_name" >> $log
+
+#--------------------------------------------------------------------
+#--------------------------------------------------------------------
+#--------------------------------------------------------------------
+
+			#Check validity
+			if [ -d "$str_folder_name" ] ; then
+				cd "$str_folder_name"
+				if [ -f "SG_PROCESSING_DONE" ]; then
+					exit 0
+				fi
+				if [ -f "SG_DOWNLOAD_DONE" ] && [ ! -f "SG_UNPACKING_DONE" ]; then
+					timestamp=`date "+%Y_%m_%d_%H_%M_%S"`
+					echo "$timestamp --- Starting Extraction" >> $log
+					tar -I pigz -xvf "$str_file_name" >> $log
+					tar_exit_code=$?
+					if [ "$tar_exit_code" == "0" ]; then
+						echo "" > "SG_UNPACKING_DONE"
+						timestamp=`date "+%Y_%m_%d_%H_%M_%S"`
+						echo "$timestamp --- Unpacking finished successfully" >> $log
+					else
+						timestamp=`date "+%Y_%m_%d_%H_%M_%S"`		
+						echo "$timestamp --- Tar exit code: $tar_exit_code" >> $log
+						exit 3
+					fi
+				elif [ ! -f "SG_UNPACKING_DONE" ]; then
+					echo "Downloaded-File not found. This message should never appear."
+					exit 2
+				fi
+				if [ -f "SG_UNPACKING_DONE" ] ; then
+					timestamp=`date "+%Y_%m_%d_%H_%M_%S"`
+					echo "$timestamp --- Starting Conversion" >> $log
+					for d in */ ; do
+						java -jar ../Converter/out/artifacts/converter_main_jar/converter_main.jar "$d" -debug >> $log 2>&1 ; java_exit_code=$? 
+					done
+					if [ "$java_exit_code" == "0" ]; then 
+						timestamp=`date "+%Y_%m_%d_%H_%M_%S"`
+						if [ "$keep_data" == false ]; then
+							echo "$timestamp --- Translation sucseeded. Removing .csv and unused .ttl ." >> $log
+							echo "$timestamp --- Translation sucseeded. Removing .csv and unused .ttl ." 
+							rm **/* >/dev/null 2>&1
+						else
+							echo "$timestamp --- Translation sucseeded. Removing .ttl. Please remove all .csv manually if needed." >> $log
+							echo "$timestamp --- Translation sucseeded. Removing .ttl. Please remove all .csv manually if needed." 
+						fi
+						echo "" > "SG_PROCESSING_DONE"
+					elif [ "$java_exit_code" == "2" ]; then
+						timestamp=`date "+%Y_%m_%d_%H_%M_%S"`		
+						echo "$timestamp --- Translation sucseeded partially, as some input lines are corrupted. Please remove all .csv manually if needed."  >> $log
+						echo "$timestamp --- Translation sucseeded partially, as some input lines are corrupted. Please remove all .csv manually if needed."
+						echo "" > "SG_PROCESSING_DONE"
+					else
+						timestamp=`date "+%Y_%m_%d_%H_%M_%S"`		
+						echo "$timestamp --- Translation did not sucseed. Check for Java Errors" >> $log
+						echo "$timestamp --- Translation did not sucseed. Check for Java Errors" 
+						exit 4
+					fi
+
+				fi
+			else 
+				echo "Faulty Parameters set."
+				exit 1
+			fi
+
+
+#--------------------------------------------------------------------
+#--------------------------------------------------------------------
+#--------------------------------------------------------------------
 		fi
 	fi
 fi
