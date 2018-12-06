@@ -21,3 +21,5 @@ Options include:
 -nomerging - does not create a combined.ttl file, but instead keeps one file per input csv file.
 
 -nostrings - does not include user comments in output. This can be used to create a cleaner output that is easier to parse by another application.
+
+-noblank - forces the converter to not create any blank nodes, but assign unique identifiert for all entities. We use this for some internal evaluations in a key value store.
