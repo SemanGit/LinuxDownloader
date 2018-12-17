@@ -1,9 +1,7 @@
 package de.semangit;
 
-import com.datastax.driver.core.Cluster;
-import com.datastax.driver.core.ResultSet;
-import com.datastax.driver.core.Row;
-import com.datastax.driver.core.Session;
+//import com.datastax.driver.core.*;
+import com.datastax.driver.core.*;
 import com.opencsv.CSVReader;
 
 import java.io.*;
@@ -33,9 +31,14 @@ public class Converter implements Runnable {
     private static Random rnd = new Random();
 
 
+    //private static boolean useCassandra = false;
+    private static Cluster cluster = null;
+    private static Session session = null;
+
+
     //private static final String PREFIX_Semangit = "<http://www.semangit.de/ontology/>";
     private static final String TAG_Semangit = "semangit:"; //TODO: Speed option: Instead of concatenating "semangit:" to all IDs at runtime, do this once at the beginning for all identifiers.
-    private static final String TAG_Userprefix = "ghuser_";
+    private static final String TAG_Userprefix = "ghuser_"; //TODO: Not conforming the ontology. Need to rename those strings here
     private static final String TAG_Repoprefix = "ghrepo_";
     private static final String TAG_Commitprefix = "ghcom_";
     private static final String TAG_Commentprefix = "ghcomment_";
@@ -214,7 +217,30 @@ public class Converter implements Runnable {
 
     }
 
-    private static Map<String, Integer> prefixCtr = new HashMap<>();
+
+    private static Map<String, Long> prefixCtr = new HashMap<>();
+
+    private static void postIncrementCounter(String s) { //in case of abbreviation, call this function to
+        if (prefixing) {
+            if (prefixTable.get(s) == null) {
+                System.out.println("Prefix for " + s + " missing.");
+            }
+            if(debug) {
+                long ctr = 0;
+                try {
+                    if (prefixCtr.containsKey(s)) {
+                        ctr = prefixCtr.get(s);
+                    }
+                } catch (NullPointerException e) {
+
+                    //System.out.println("For some random reason, no prefix counter for " + s + " could be retrieved.");
+                    //e.printStackTrace();
+                }
+
+                prefixCtr.put(s, ++ctr);
+            }
+        }
+    }
 
     private static String getPrefix(String s)
     {
@@ -222,19 +248,20 @@ public class Converter implements Runnable {
             if (prefixTable.get(s) == null) {
                 System.out.println("Prefix for " + s + " missing.");
             }
-            int ctr = 0;
-            try {
-                if (prefixCtr.containsKey(s)) {
-                    ctr = prefixCtr.get(s);
-                }
-            }
-            catch (NullPointerException e)
-            {
+            if(debug) {
+                long ctr = 0;
+                try {
+                    if (prefixCtr.containsKey(s)) {
+                        ctr = prefixCtr.get(s);
+                    }
+                } catch (NullPointerException e) {
 
-                //System.out.println("For some random reason, no prefix counter for " + s + " could be retrieved.");
-                //e.printStackTrace();
+                    //System.out.println("For some random reason, no prefix counter for " + s + " could be retrieved.");
+                    //e.printStackTrace();
+                }
+
+                prefixCtr.put(s, ++ctr);
             }
-            prefixCtr.put(s, ++ctr);
             return prefixTable.get(s) + ":";
         }
         else {
@@ -450,6 +477,21 @@ public class Converter implements Runnable {
             return input;
         }
     }
+
+    private static Statement trash;
+
+    private static HashMap<Long, BatchStatement> batches = new HashMap<>();
+    private static PreparedStatement defaultInsert = null;
+    private static PreparedStatement defaultSelect = null;
+    private static PreparedStatement insertIncoming = null;
+    private static PreparedStatement updateIncoming = null;
+    //private static BatchStatement batch = null;
+
+    /*TODO:
+        Do only one table, not incoming and outgoing. Do stuff like projects, users and commits first. Then, add a column "incoming"
+        to the table. If we treat this as a list, we can simply do update commands and append to the list
+        This should drastically reduce time required. However, it's not a perfect solution, as we cannot cluster many update queries into one query. Need some kind of sorting for that.
+    */
     private static void printTriples(String currentTriple, ArrayList<BufferedWriter> writers)
     {
         try {
@@ -461,10 +503,136 @@ public class Converter implements Runnable {
                 ctr += currentTriple.length() - currentTriple.replace(";\n", "\n").length(); //occurrences of terminating semicolons
 
                 numTriples.addAndGet(ctr);
+                //TODO: This will cause an overflow. Need to use 64 bits!
             }
             switch (sampling)
             {
-                case 0: writers.get(0).write(currentTriple);break; //no sampling
+                case 0:
+                    if(cluster != null) //use Cassandra to store data instead of a local file
+                    {
+                        //session.execute("insert into github.combined (k, v, bucket, inc) values ('dennis', 'smells', 'yeah', ['shit', 'crap', 'dung'])");
+                        //session.execute("update github.combined set inc = inc + ['and much more'] where bucket = 'yeah' and k = 'dennis'");
+
+                        BatchStatement batch;
+                        if(defaultInsert == null)
+                        {
+                            defaultInsert = session.prepare("insert into github.myTable (k, v, bucket) values (?, ?, ?)");
+                            insertIncoming = session.prepare("insert into github.incoming (k, inc, bucket) values (?, ?, ?)");
+                            updateIncoming = session.prepare("update github.incoming set inc = ? where bucket = ? and k = ?");
+                        }
+                        batch = batches.get(Thread.currentThread().getId());
+                        if(batch == null)
+                        {
+                            batch = new BatchStatement();
+                            batches.put(Thread.currentThread().getId(), batch);
+                        }
+                        int spaceIndex = currentTriple.indexOf(" ");
+                        //currentTriple.indexOf()
+                        //separating space (key, SPACE, value) is not stored in key or value
+
+                        //use last character of entity as bucket for partitioning
+                        Character bucket = currentTriple.charAt(spaceIndex - 1);
+                        if(bucket == ':')
+                        {
+                            bucket = '0';
+                        }
+
+                        String key = currentTriple.substring(0, spaceIndex);
+
+                        //TODO at end of process, submit batch
+                        batch.add(defaultInsert.bind(key, currentTriple.substring(spaceIndex + 1), bucket.toString()));
+                        if(batch.size() > 100) {
+                            //System.out.println("Batch size is " + batch.size());
+                            session.execute(batch);
+                            batch = batch.clear();
+                            batches.put(Thread.currentThread().getId(), batch);
+                        }
+
+
+                        //update in edges for nodes in those triples
+                        ArrayList<String> entities = extractConnectedEntities(currentTriple);
+
+
+                        //The code below drastically increases the time required for the parser to handle the dataset.
+                        //Enable it only to do some graph traversal stuff like BFS.
+
+                        //ConcurrentMap<String, String> concMap = new ConcurrentHashMap<>();
+                        //first element of concMap is partition key
+
+
+                        //lets try something stupid: no partitioning... lol
+
+
+
+                        //TODO: Create BatchStatement that is clustered by partition rather than by the outgoing node.
+
+
+                        BatchStatement batchStatement = new BatchStatement();
+
+
+                        if(defaultSelect == null)
+                        {
+                            defaultSelect = session.prepare(("select inc from github.incoming WHERE bucket = ? AND k = ?"));
+                        }
+
+                        for(String entity : entities)
+                        {
+                            //spaceIndex = entity.indexOf(" ");
+
+                            bucket = entity.charAt(entity.length() - 1);
+                            if(bucket == ':')
+                            {
+                                bucket = '0';
+                            }
+
+
+                            //TODO: BAD! This causes MASSIVE delays!!! Do an async query...
+                            ResultSet rs = session.execute(defaultSelect.bind("1", entity));
+                            Row res = rs.one();
+
+                            //IDEA:...
+                            //session.executeAsync()
+
+
+                            if(res == null) {
+                                //incomings = entity;
+                                try {
+                                    batchStatement.add(insertIncoming.bind(entity, key, "1"));
+                                }
+                                catch (IllegalStateException e)
+                                {
+                                    System.out.println("More than 65k entries. Triple is: " + currentTriple);
+                                    e.printStackTrace();
+                                    System.exit(1);
+                                }
+
+                            }
+                            else
+                            {
+                                String incomings = res.getString("inc");
+                                if(!incomings.contains(key)) {
+                                    incomings = incomings.concat("|" + key);
+                                    batchStatement.add(updateIncoming.bind(incomings, "1", entity));
+                                }
+                            }
+                            if(batchStatement.size() >= 100) //avoids crash where some repositories have > 65k commits, creating an overflow in the IDs for batch statements
+                            {
+                                session.execute(batchStatement);
+                                batchStatement = batchStatement.clear();
+                            }
+                            //check if there is a database entry for entity to append to, else create.
+
+                        }
+                        if(batchStatement.size() != 0) {
+                            session.execute(batchStatement);
+                            //batchStatement = batchStatement.clear();
+                        }
+
+                    }
+                    else {
+                        writers.get(0).write(currentTriple);
+                    }
+                    break;
                 //cases 1 and 2 (head/tail sampling) removed. doing those via bash instead for better performance
                 case 3:           //random sampling with given percentage(s)
                     if(samplingPercentages.size() == 1) //only one sample to be generated
@@ -484,6 +652,7 @@ public class Converter implements Runnable {
                             }
                         }
                     }
+                    break;
                 case 4: case 5: //connected & bfs
                 //get last 2 digits of identifier, if its not a blank node (i.e. has no identifier)
                 if(currentTriple.charAt(2) == '[' || currentTriple.charAt(0) == '[' || currentTriple.charAt(1) == '[')
@@ -568,6 +737,8 @@ public class Converter implements Runnable {
                 if (!abbreviated) {
                     currentTriple.append(b64(getPrefix(TAG_Semangit + TAG_Commitprefix) + curLine[0]) ).append( " " ).append( getPrefix(TAG_Semangit + "commit_has_parent") ).append( " " ).append( b64(getPrefix(TAG_Semangit + TAG_Commitprefix) + curLine[1]));
                 } else {
+                    postIncrementCounter(TAG_Semangit + TAG_Commitprefix);
+                    postIncrementCounter(TAG_Semangit + "commit_has_parent");
                     currentTriple.append(b64(getPrefix(TAG_Semangit + TAG_Commitprefix) + curLine[1])); //only specifying next object. subject/predicate are abbreviated
                 }
                 if (curLine[0].equals(nextLine[0])) {
@@ -586,6 +757,8 @@ public class Converter implements Runnable {
                 if (!abbreviated) {
                     currentTriple.append(b64(getPrefix(TAG_Semangit + TAG_Commitprefix) + curLine[0]) ).append( " " ).append( getPrefix(TAG_Semangit + "commit_has_parent") ).append( " " ).append( b64(getPrefix(TAG_Semangit + TAG_Commitprefix) + curLine[1]) ).append( ".");
                 } else {
+                    postIncrementCounter(TAG_Semangit + TAG_Commitprefix);
+                    postIncrementCounter(TAG_Semangit + "commit_has_parent");
                     currentTriple.append(b64(getPrefix(TAG_Semangit + TAG_Commitprefix) + curLine[1]) ).append( "."); //only specifying next object. subject/predicate are abbreviated
                 }
                 currentTriple.append("\n");
@@ -824,6 +997,8 @@ public class Converter implements Runnable {
 
                 if(abbreviated)
                 {
+                    postIncrementCounter(TAG_Semangit + TAG_Repolabelprefix);
+                    postIncrementCounter(TAG_Semangit + "github_issue_label_used_by");
                     currentTriple.append(b64(getPrefix(TAG_Semangit + TAG_Issueprefix) + curLine[1])); //only print object
                 }
                 else
@@ -849,6 +1024,8 @@ public class Converter implements Runnable {
             }
             if(abbreviated)
             {
+                postIncrementCounter(TAG_Semangit + TAG_Repolabelprefix);
+                postIncrementCounter(TAG_Semangit + "github_issue_label_used_by");
                 currentTriple.append(b64(getPrefix(TAG_Semangit + TAG_Issueprefix) + curLine[1])); //only print object
             }
             else
@@ -1058,6 +1235,8 @@ public class Converter implements Runnable {
 
                 if(abbreviated) //abbreviated in previous step. Only need to print object now
                 {
+                    postIncrementCounter(TAG_Semangit + TAG_Commitprefix);
+                    postIncrementCounter(TAG_Semangit + "repository_has_commit");
                     sb.append(b64(getPrefix(TAG_Semangit + TAG_Repoprefix) + curLine[1])); //one commit for multiple repositories (branching / merging)
                 }
                 else //no abbreviation occurred. Full subject predicate object triple printed
@@ -1081,6 +1260,8 @@ public class Converter implements Runnable {
             //handle last line
             if(abbreviated) //abbreviated in previous step. Only need to print object now
             {
+                postIncrementCounter(TAG_Semangit + TAG_Commitprefix);
+                postIncrementCounter(TAG_Semangit + "repository_has_commit");
                 sb.append(b64(getPrefix(TAG_Semangit + TAG_Repoprefix) + curLine[1]) ); //one commit for multiple repositories (branching / merging)
             }
             else //no abbreviation occurred. Full subject predicate object triple printed
@@ -1283,6 +1464,8 @@ public class Converter implements Runnable {
 
                 if(abbreviated)
                 {
+                    postIncrementCounter(TAG_Semangit + TAG_Commitprefix);
+                    postIncrementCounter(TAG_Semangit + "pull_request_has_commit");
                     currentTriple.append(b64(getPrefix(TAG_Semangit + TAG_Commitprefix) + curLine[1]));
                 }
                 else
@@ -1308,6 +1491,8 @@ public class Converter implements Runnable {
             //handle last line of file
             if(abbreviated)
             {
+                postIncrementCounter(TAG_Semangit + TAG_Commitprefix);
+                postIncrementCounter(TAG_Semangit + "pull_request_has_commit");
                 currentTriple.append(b64(getPrefix(TAG_Semangit + TAG_Commitprefix) + curLine[1]) ).append( ".");
             }
             else
@@ -2204,9 +2389,10 @@ public class Converter implements Runnable {
     }
 
 
-/*
-    private static ArrayList<String> extractConnectedEntities(ArrayList<String> inputTriple)
+    //TODO: Figgure out some way to check if this is the bottle neck when handling projects with 100k+ commmits... BIG ISSUE
+    private static ArrayList<String> extractConnectedEntities(String inputTripleString)
     {
+        String[] inputTriple = inputTripleString.split("\n");
         ArrayList<String> output = new ArrayList<>();
         for (String s : inputTriple)
         {
@@ -2249,7 +2435,7 @@ public class Converter implements Runnable {
         }
         return output;
     }
-*/
+
 
     /*
     private static String entityToIdentifier(String entity)
@@ -2724,17 +2910,7 @@ public class Converter implements Runnable {
 
     public static void main(String[] args)
     {
-        try (Cluster cluster = Cluster.builder().addContactPoint("127.0.0.1").withClusterName("SemanGit Cluster").build())
-        {
-            Session session = cluster.connect();
-            ResultSet rs = session.execute("select release_version from system.local");
-            Row row = rs.one();
-            System.out.println(row.getString("release_version"));
-        }
-        catch (Exception e)
-        {
-            e.printStackTrace();
-        }
+        long startTime = System.currentTimeMillis();
 
         if(args.length > 1)
         {
@@ -2837,6 +3013,22 @@ public class Converter implements Runnable {
                     useBlankNodes = false;
                     //TODO to be documented
                 }
+                else if(s.contains("-cassandra"))
+                {
+                    try
+                    {
+                        cluster = Cluster.builder().addContactPoint("127.0.0.1").withClusterName("SemanGit Cluster").build();
+                        session = cluster.connect();
+                        //ResultSet rs = session.execute("select release_version from system.local");
+                        //Row row = rs.one();
+                        //System.out.println(row.getString("release_version"));
+                    }
+                    catch (Exception e)
+                    {
+                        e.printStackTrace();
+                        System.exit(1);
+                    }
+                }
                 else
                 {
                     if(!s.equals(args[0].toLowerCase()))
@@ -2871,7 +3063,7 @@ public class Converter implements Runnable {
             }
         }
         try {
-            numTriples = new AtomicInteger(0);
+            numTriples = new AtomicInteger(0); //TODO: Make into AtomicLong
             File index = new File(args[0] + "rdf");
             if (!index.exists() && !index.mkdirs()) {
                 System.out.println("Unable to create " + args[0] + "rdf/ directory. Exiting.");
@@ -2880,6 +3072,8 @@ public class Converter implements Runnable {
             rdfPath = args[0] + "rdf/";
             initPrefixTable();
             parseSQLSchema(args[0]);
+
+
 
             System.out.println();
 
@@ -2992,6 +3186,7 @@ public class Converter implements Runnable {
         if(errorCtr != 0)
         {
             System.out.println("A total of " + errorCtr + " errors occurred.");
+            System.out.println("Time taken: " + (System.currentTimeMillis() - startTime) / 1000 + "s");
             System.exit(2);
         }
 
@@ -3020,12 +3215,13 @@ public class Converter implements Runnable {
                 }
             }
             System.out.println("Now printing statistics for prefix usage for further optimization.");
-            final Set<Map.Entry<String, Integer>> prefixCtrs = prefixCtr.entrySet();
-            for (Map.Entry<String, Integer> entry : prefixCtrs) {
+            final Set<Map.Entry<String, Long>> prefixCtrs = prefixCtr.entrySet();
+            for (Map.Entry<String, Long> entry : prefixCtrs) {
                 System.out.println("URI: " + entry.getKey() + " -- Used Prefix: " + prefixTable.get(entry.getKey()) + " -- Counter: " + entry.getValue());
             }
             System.out.println("Num triples: " + numTriples.get());
         }
+        System.out.println("Time taken: " + (System.currentTimeMillis() - startTime) / 1000 + "s");
         System.exit(0);
 
     }
