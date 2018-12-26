@@ -1,5 +1,7 @@
 package de.semangit;
 
+//import com.datastax.driver.core.*;
+import com.datastax.driver.core.*;
 import com.opencsv.CSVReader;
 
 import java.io.*;
@@ -10,9 +12,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 public class Converter implements Runnable {
 
-    static AtomicInteger numTriples;
+    private static AtomicInteger numTriples;
 
-
+    private static boolean useBlankNodes = true;
     private String workOnFile;
     private String path;
     private static boolean debug = false;
@@ -29,9 +31,14 @@ public class Converter implements Runnable {
     private static Random rnd = new Random();
 
 
+    //private static boolean useCassandra = false;
+    private static Cluster cluster = null;
+    private static Session session = null;
+
+
     //private static final String PREFIX_Semangit = "<http://www.semangit.de/ontology/>";
     private static final String TAG_Semangit = "semangit:"; //TODO: Speed option: Instead of concatenating "semangit:" to all IDs at runtime, do this once at the beginning for all identifiers.
-    private static final String TAG_Userprefix = "ghuser_";
+    private static final String TAG_Userprefix = "ghuser_"; //TODO: Not conforming the ontology. Need to rename those strings here
     private static final String TAG_Repoprefix = "ghrepo_";
     private static final String TAG_Commitprefix = "ghcom_";
     private static final String TAG_Commentprefix = "ghcomment_";
@@ -39,6 +46,15 @@ public class Converter implements Runnable {
     private static final String TAG_Pullrequestprefix = "ghpr_";
     private static final String TAG_Repolabelprefix = "ghlb_";
     private static final String TAG_Langprefix = "ghlang_";
+    private static final String TAG_Followprefix = "ghfollow_";
+    private static final String TAG_Issue_Eventprefix = "ghissueevent_";
+    private static final String TAG_Orga_Join_Eventprefix = "ghorgajoinevent_";
+    private static final String TAG_Repo_Join_Eventprefix = "ghrepojoinevent_";
+    private static final String TAG_Issue_Commentprefix = "ghissuecomment_";
+    private static final String TAG_Pullrequest_Commentprefix = "ghprcomment_";
+    private static final String TAG_Repolangprefix = "ghrepolang_";
+    private static final String TAG_Pullrequest_Actionprefix = "ghpraction_";
+    private static final String TAG_Watcherprefix = "ghwatcher_";
 
     private static int errorCtr = 0;
 
@@ -188,19 +204,43 @@ public class Converter implements Runnable {
 
         prefixTable.put(TAG_Semangit + "commit_repository", "q");
 
+        prefixTable.put(TAG_Semangit + TAG_Followprefix, "ce");
+        prefixTable.put(TAG_Semangit + TAG_Issue_Eventprefix, "cf");
+        prefixTable.put(TAG_Semangit + TAG_Orga_Join_Eventprefix, "cg");
+        prefixTable.put(TAG_Semangit + TAG_Repo_Join_Eventprefix, "ch");
+        prefixTable.put(TAG_Semangit + TAG_Issue_Commentprefix, "ci");
+        prefixTable.put(TAG_Semangit + TAG_Pullrequest_Commentprefix, "cj");
+        prefixTable.put(TAG_Semangit + TAG_Repolangprefix, "ck");
+        prefixTable.put(TAG_Semangit + TAG_Pullrequest_Actionprefix, "cl");
+        prefixTable.put(TAG_Semangit + TAG_Watcherprefix, "cm");
         //tag "CD" used farther up
-        /*
-        prefixTable.put(, "ce");
-        prefixTable.put(, "cf");
-        prefixTable.put(, "cg");
-        prefixTable.put(, "ch");
-        prefixTable.put(, "ci");
-        prefixTable.put(, "cj");
-        prefixTable.put(, "ck");*/
 
     }
 
-    private static Map<String, Integer> prefixCtr = new HashMap<>();
+
+    private static Map<String, Long> prefixCtr = new HashMap<>();
+
+    private static void postIncrementCounter(String s) { //in case of abbreviation, call this function to
+        if (prefixing) {
+            if (prefixTable.get(s) == null) {
+                System.out.println("Prefix for " + s + " missing.");
+            }
+            if(debug) {
+                long ctr = 0;
+                try {
+                    if (prefixCtr.containsKey(s)) {
+                        ctr = prefixCtr.get(s);
+                    }
+                } catch (NullPointerException e) {
+
+                    //System.out.println("For some random reason, no prefix counter for " + s + " could be retrieved.");
+                    //e.printStackTrace();
+                }
+
+                prefixCtr.put(s, ++ctr);
+            }
+        }
+    }
 
     private static String getPrefix(String s)
     {
@@ -208,19 +248,20 @@ public class Converter implements Runnable {
             if (prefixTable.get(s) == null) {
                 System.out.println("Prefix for " + s + " missing.");
             }
-            int ctr = 0;
-            try {
-                if (prefixCtr.containsKey(s)) {
-                    ctr = prefixCtr.get(s);
-                }
-            }
-            catch (NullPointerException e)
-            {
+            if(debug) {
+                long ctr = 0;
+                try {
+                    if (prefixCtr.containsKey(s)) {
+                        ctr = prefixCtr.get(s);
+                    }
+                } catch (NullPointerException e) {
 
-                //System.out.println("For some random reason, no prefix counter for " + s + " could be retrieved.");
-                //e.printStackTrace();
+                    //System.out.println("For some random reason, no prefix counter for " + s + " could be retrieved.");
+                    //e.printStackTrace();
+                }
+
+                prefixCtr.put(s, ++ctr);
             }
-            prefixCtr.put(s, ++ctr);
             return prefixTable.get(s) + ":";
         }
         else {
@@ -436,22 +477,162 @@ public class Converter implements Runnable {
             return input;
         }
     }
+
+    private static Statement trash;
+
+    private static HashMap<Long, BatchStatement> batches = new HashMap<>();
+    private static PreparedStatement defaultInsert = null;
+    private static PreparedStatement defaultSelect = null;
+    private static PreparedStatement insertIncoming = null;
+    private static PreparedStatement updateIncoming = null;
+    //private static BatchStatement batch = null;
+
+    /*TODO:
+        Do only one table, not incoming and outgoing. Do stuff like projects, users and commits first. Then, add a column "incoming"
+        to the table. If we treat this as a list, we can simply do update commands and append to the list
+        This should drastically reduce time required. However, it's not a perfect solution, as we cannot cluster many update queries into one query. Need some kind of sorting for that.
+    */
     private static void printTriples(String currentTriple, ArrayList<BufferedWriter> writers)
     {
         try {
+            //experimental: count triples. To be replaced by some database query
+            if(debug) {
+                int ctr = 0;
+                ctr += currentTriple.length() - currentTriple.replace(".\n", "\n").length(); //occurrences of terminating dots
+                ctr += currentTriple.length() - currentTriple.replace(",\n", "\n").length(); //occurrences of terminating commas
+                ctr += currentTriple.length() - currentTriple.replace(";\n", "\n").length(); //occurrences of terminating semicolons
 
-            //experimental: count triples
-/*
-            int ctr = 0;
-            ctr += currentTriple.length() - currentTriple.replace(".\n", "\n").length(); //occurrences of terminating dots
-            ctr += currentTriple.length() - currentTriple.replace(",\n", "\n").length(); //occurrences of terminating commas
-            ctr += currentTriple.length() - currentTriple.replace(";\n", "\n").length(); //occurrences of terminating semicolons
-
-            numTriples.addAndGet(ctr);
-*/
+                numTriples.addAndGet(ctr);
+                //TODO: This will cause an overflow. Need to use 64 bits!
+            }
             switch (sampling)
             {
-                case 0: writers.get(0).write(currentTriple);break; //no sampling
+                case 0:
+                    if(cluster != null) //use Cassandra to store data instead of a local file
+                    {
+                        //session.execute("insert into github.combined (k, v, bucket, inc) values ('dennis', 'smells', 'yeah', ['shit', 'crap', 'dung'])");
+                        //session.execute("update github.combined set inc = inc + ['and much more'] where bucket = 'yeah' and k = 'dennis'");
+
+                        BatchStatement batch;
+                        if(defaultInsert == null)
+                        {
+                            defaultInsert = session.prepare("insert into github.myTable (k, v, bucket) values (?, ?, ?)");
+                            insertIncoming = session.prepare("insert into github.incoming (k, inc, bucket) values (?, ?, ?)");
+                            updateIncoming = session.prepare("update github.incoming set inc = ? where bucket = ? and k = ?");
+                        }
+                        batch = batches.get(Thread.currentThread().getId());
+                        if(batch == null)
+                        {
+                            batch = new BatchStatement();
+                            batches.put(Thread.currentThread().getId(), batch);
+                        }
+                        int spaceIndex = currentTriple.indexOf(" ");
+                        //currentTriple.indexOf()
+                        //separating space (key, SPACE, value) is not stored in key or value
+
+                        //use last character of entity as bucket for partitioning
+                        Character bucket = currentTriple.charAt(spaceIndex - 1);
+                        if(bucket == ':')
+                        {
+                            bucket = '0';
+                        }
+
+                        String key = currentTriple.substring(0, spaceIndex);
+
+                        //TODO at end of process, submit batch
+                        batch.add(defaultInsert.bind(key, currentTriple.substring(spaceIndex + 1), bucket.toString()));
+                        if(batch.size() > 100) {
+                            //System.out.println("Batch size is " + batch.size());
+                            session.execute(batch);
+                            batch = batch.clear();
+                            batches.put(Thread.currentThread().getId(), batch);
+                        }
+
+
+                        //update in edges for nodes in those triples
+                        ArrayList<String> entities = extractConnectedEntities(currentTriple);
+
+
+                        //The code below drastically increases the time required for the parser to handle the dataset.
+                        //Enable it only to do some graph traversal stuff like BFS.
+
+                        //ConcurrentMap<String, String> concMap = new ConcurrentHashMap<>();
+                        //first element of concMap is partition key
+
+
+                        //lets try something stupid: no partitioning... lol
+
+
+
+                        //TODO: Create BatchStatement that is clustered by partition rather than by the outgoing node.
+
+
+                        BatchStatement batchStatement = new BatchStatement();
+
+
+                        if(defaultSelect == null)
+                        {
+                            defaultSelect = session.prepare(("select inc from github.incoming WHERE bucket = ? AND k = ?"));
+                        }
+
+                        for(String entity : entities)
+                        {
+                            //spaceIndex = entity.indexOf(" ");
+
+                            bucket = entity.charAt(entity.length() - 1);
+                            if(bucket == ':')
+                            {
+                                bucket = '0';
+                            }
+
+
+                            //TODO: BAD! This causes MASSIVE delays!!! Do an async query...
+                            ResultSet rs = session.execute(defaultSelect.bind("1", entity));
+                            Row res = rs.one();
+
+                            //IDEA:...
+                            //session.executeAsync()
+
+
+                            if(res == null) {
+                                //incomings = entity;
+                                try {
+                                    batchStatement.add(insertIncoming.bind(entity, key, "1"));
+                                }
+                                catch (IllegalStateException e)
+                                {
+                                    System.out.println("More than 65k entries. Triple is: " + currentTriple);
+                                    e.printStackTrace();
+                                    System.exit(1);
+                                }
+
+                            }
+                            else
+                            {
+                                String incomings = res.getString("inc");
+                                if(!incomings.contains(key)) {
+                                    incomings = incomings.concat("|" + key);
+                                    batchStatement.add(updateIncoming.bind(incomings, "1", entity));
+                                }
+                            }
+                            if(batchStatement.size() >= 100) //avoids crash where some repositories have > 65k commits, creating an overflow in the IDs for batch statements
+                            {
+                                session.execute(batchStatement);
+                                batchStatement = batchStatement.clear();
+                            }
+                            //check if there is a database entry for entity to append to, else create.
+
+                        }
+                        if(batchStatement.size() != 0) {
+                            session.execute(batchStatement);
+                            //batchStatement = batchStatement.clear();
+                        }
+
+                    }
+                    else {
+                        writers.get(0).write(currentTriple);
+                    }
+                    break;
                 //cases 1 and 2 (head/tail sampling) removed. doing those via bash instead for better performance
                 case 3:           //random sampling with given percentage(s)
                     if(samplingPercentages.size() == 1) //only one sample to be generated
@@ -471,6 +652,7 @@ public class Converter implements Runnable {
                             }
                         }
                     }
+                    break;
                 case 4: case 5: //connected & bfs
                 //get last 2 digits of identifier, if its not a blank node (i.e. has no identifier)
                 if(currentTriple.charAt(2) == '[' || currentTriple.charAt(0) == '[' || currentTriple.charAt(1) == '[')
@@ -555,6 +737,8 @@ public class Converter implements Runnable {
                 if (!abbreviated) {
                     currentTriple.append(b64(getPrefix(TAG_Semangit + TAG_Commitprefix) + curLine[0]) ).append( " " ).append( getPrefix(TAG_Semangit + "commit_has_parent") ).append( " " ).append( b64(getPrefix(TAG_Semangit + TAG_Commitprefix) + curLine[1]));
                 } else {
+                    postIncrementCounter(TAG_Semangit + TAG_Commitprefix);
+                    postIncrementCounter(TAG_Semangit + "commit_has_parent");
                     currentTriple.append(b64(getPrefix(TAG_Semangit + TAG_Commitprefix) + curLine[1])); //only specifying next object. subject/predicate are abbreviated
                 }
                 if (curLine[0].equals(nextLine[0])) {
@@ -573,6 +757,8 @@ public class Converter implements Runnable {
                 if (!abbreviated) {
                     currentTriple.append(b64(getPrefix(TAG_Semangit + TAG_Commitprefix) + curLine[0]) ).append( " " ).append( getPrefix(TAG_Semangit + "commit_has_parent") ).append( " " ).append( b64(getPrefix(TAG_Semangit + TAG_Commitprefix) + curLine[1]) ).append( ".");
                 } else {
+                    postIncrementCounter(TAG_Semangit + TAG_Commitprefix);
+                    postIncrementCounter(TAG_Semangit + "commit_has_parent");
                     currentTriple.append(b64(getPrefix(TAG_Semangit + TAG_Commitprefix) + curLine[1]) ).append( "."); //only specifying next object. subject/predicate are abbreviated
                 }
                 currentTriple.append("\n");
@@ -653,6 +839,7 @@ public class Converter implements Runnable {
                     }
                 }
             }
+            int idCtr = 0;
 
             String[] nextLine;
 
@@ -663,16 +850,34 @@ public class Converter implements Runnable {
                     continue;
                 }
 
-                currentTriple.append("[ a " ).append( getPrefix(TAG_Semangit + "github_follow_event") ).append( ";");
-                currentTriple.append("\n");
-                currentTriple.append(getPrefix(TAG_Semangit + "github_following_since") ).append( " \"" ).append( nextLine[2] ).append( "\";");
-                currentTriple.append("\n");
-                currentTriple.append(getPrefix(TAG_Semangit + "github_user_or_project") ).append( " false ] " ).append( getPrefix(TAG_Semangit + "github_follower") ).append( " " ).append( b64(getPrefix(TAG_Semangit  + TAG_Userprefix) + nextLine[1]) ).append( ";");
-                currentTriple.append("\n");
-                currentTriple.append(getPrefix(TAG_Semangit + "github_follows") ).append( " " ).append( b64(getPrefix(TAG_Semangit  + TAG_Userprefix) + nextLine[0]) ).append( ".");
-                currentTriple.append("\n");
-                printTriples(currentTriple.toString(), writers);
-                currentTriple.setLength(0);
+                if(useBlankNodes)
+                {
+                    currentTriple.append("[ a " ).append( getPrefix(TAG_Semangit + "github_follow_event") ).append( ";");
+                    currentTriple.append("\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_following_since") ).append( " \"" ).append( nextLine[2] ).append( "\";");
+                    currentTriple.append("\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_user_or_project") ).append( " false ] " ).append( getPrefix(TAG_Semangit + "github_follower") ).append( " " ).append( b64(getPrefix(TAG_Semangit  + TAG_Userprefix) + nextLine[1]) ).append( ";");
+                    currentTriple.append("\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_follows") ).append( " " ).append( b64(getPrefix(TAG_Semangit  + TAG_Userprefix) + nextLine[0]) ).append( ".");
+                    currentTriple.append("\n");
+                    printTriples(currentTriple.toString(), writers);
+                    currentTriple.setLength(0);
+
+                }
+                else
+                {
+                    currentTriple.append(b64(getPrefix(TAG_Semangit + TAG_Followprefix) + idCtr++)).append(" a " ).append( getPrefix(TAG_Semangit + "github_follow_event") ).append( ";");
+                    currentTriple.append("\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_following_since") ).append( " \"" ).append( nextLine[2] ).append( "\";");
+                    currentTriple.append("\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_user_or_project") ).append( " false;\n " ).append( getPrefix(TAG_Semangit + "github_follower") ).append( " " ).append( b64(getPrefix(TAG_Semangit  + TAG_Userprefix) + nextLine[1]) ).append( ";");
+                    currentTriple.append("\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_follows") ).append( " " ).append( b64(getPrefix(TAG_Semangit  + TAG_Userprefix) + nextLine[0]) ).append( ".");
+                    currentTriple.append("\n");
+                    printTriples(currentTriple.toString(), writers);
+                    currentTriple.setLength(0);
+
+                }
             }
             for(BufferedWriter w : writers)
             {
@@ -711,23 +916,42 @@ public class Converter implements Runnable {
                     continue;
                 }
 
-                //event id, issue id, actor id, action, action specific sha, created at
-                currentTriple.append("[ a " ).append( getPrefix(TAG_Semangit + "github_issue_event") ).append( ";");
-                currentTriple.append("\n");
-                currentTriple.append(getPrefix(TAG_Semangit + "github_issue_event_created_at") ).append( " \"" ).append( formatDateTime(nextLine[5]) ).append( "\"^^xsd:dateTime;");
-                currentTriple.append("\n");
-                if(!nextLine[4].equals("N"))
-                {
-                    currentTriple.append(getPrefix(TAG_Semangit + "github_issue_event_action_specific_sha") ).append( " \"" ).append( nextLine[4] ).append( "\";");
+                if(useBlankNodes) {
+                    //event id, issue id, actor id, action, action specific sha, created at
+                    currentTriple.append("[ a ").append(getPrefix(TAG_Semangit + "github_issue_event")).append(";");
                     currentTriple.append("\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_issue_event_created_at")).append(" \"").append(formatDateTime(nextLine[5])).append("\"^^xsd:dateTime;");
+                    currentTriple.append("\n");
+                    if (!nextLine[4].equals("N")) {
+                        currentTriple.append(getPrefix(TAG_Semangit + "github_issue_event_action_specific_sha")).append(" \"").append(nextLine[4]).append("\";");
+                        currentTriple.append("\n");
+                    }
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_issue_event_action")).append(" \"").append(nextLine[3]).append("\" ] ");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_issue_event_actor")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Userprefix) + nextLine[2])).append(";");
+                    currentTriple.append("\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_issue_event_for")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Issueprefix) + nextLine[1])).append(".");
+                    currentTriple.append("\n");
+                    printTriples(currentTriple.toString(), writers);
+                    currentTriple.setLength(0);
                 }
-                currentTriple.append(getPrefix(TAG_Semangit + "github_issue_event_action") ).append( " \"" ).append( nextLine[3] ).append( "\" ] ");
-                currentTriple.append(getPrefix(TAG_Semangit + "github_issue_event_actor") ).append( " " ).append( b64(getPrefix(TAG_Semangit + TAG_Userprefix) + nextLine[2]) ).append( ";");
-                currentTriple.append("\n");
-                currentTriple.append(getPrefix(TAG_Semangit + "github_issue_event_for") ).append( " " ).append( b64(getPrefix(TAG_Semangit + TAG_Issueprefix) + nextLine[1]) ).append( ".");
-                currentTriple.append("\n");
-                printTriples(currentTriple.toString(), writers);
-                currentTriple.setLength(0);
+                else
+                {
+                    currentTriple.append(b64(getPrefix(TAG_Semangit + TAG_Issue_Eventprefix) + nextLine[0])).append(" a ").append(getPrefix(TAG_Semangit + "github_issue_event")).append(";");
+                    currentTriple.append("\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_issue_event_created_at")).append(" \"").append(formatDateTime(nextLine[5])).append("\"^^xsd:dateTime;");
+                    currentTriple.append("\n");
+                    if (!nextLine[4].equals("N")) {
+                        currentTriple.append(getPrefix(TAG_Semangit + "github_issue_event_action_specific_sha")).append(" \"").append(nextLine[4]).append("\";");
+                        currentTriple.append("\n");
+                    }
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_issue_event_action")).append(" \"").append(nextLine[3]).append("\";\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_issue_event_actor")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Userprefix) + nextLine[2])).append(";");
+                    currentTriple.append("\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_issue_event_for")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Issueprefix) + nextLine[1])).append(".");
+                    currentTriple.append("\n");
+                    printTriples(currentTriple.toString(), writers);
+                    currentTriple.setLength(0);
+                }
             }
             for(BufferedWriter w : writers)
             {
@@ -773,6 +997,8 @@ public class Converter implements Runnable {
 
                 if(abbreviated)
                 {
+                    postIncrementCounter(TAG_Semangit + TAG_Repolabelprefix);
+                    postIncrementCounter(TAG_Semangit + "github_issue_label_used_by");
                     currentTriple.append(b64(getPrefix(TAG_Semangit + TAG_Issueprefix) + curLine[1])); //only print object
                 }
                 else
@@ -798,6 +1024,8 @@ public class Converter implements Runnable {
             }
             if(abbreviated)
             {
+                postIncrementCounter(TAG_Semangit + TAG_Repolabelprefix);
+                postIncrementCounter(TAG_Semangit + "github_issue_label_used_by");
                 currentTriple.append(b64(getPrefix(TAG_Semangit + TAG_Issueprefix) + curLine[1])); //only print object
             }
             else
@@ -931,6 +1159,8 @@ public class Converter implements Runnable {
             }
             String[] nextLine;
 
+            int idCtr = 0;
+
             TableSchema schema = schemata.get("organization_members");
             while ((nextLine = reader.readNext()) != null) {
                 if(brokenLineCheck(schema, nextLine))
@@ -938,15 +1168,27 @@ public class Converter implements Runnable {
                     continue;
                 }
 
-
-                currentTriple.append("[ a " ).append( getPrefix(TAG_Semangit + "github_organization_join_event") ).append( ";");
-                currentTriple.append("\n");
-                currentTriple.append(getPrefix(TAG_Semangit + "github_organization_joined_at") ).append( " \"" ).append( formatDateTime(nextLine[2]) ).append( "\"^^xsd:dateTime ] " ).append( getPrefix(TAG_Semangit + "github_organization_joined_by") ).append( " " ).append( b64(getPrefix(TAG_Semangit  + TAG_Userprefix) + nextLine[1]) ).append( ";");
-                currentTriple.append("\n");
-                currentTriple.append(getPrefix(TAG_Semangit + "github_organization_is_joined") ).append( " " ).append( b64(getPrefix(TAG_Semangit  + TAG_Userprefix) + nextLine[0]) ).append( ".");
-                currentTriple.append("\n");
-                printTriples(currentTriple.toString(), writers);
-                currentTriple.setLength(0);
+                if(useBlankNodes) {
+                    currentTriple.append("[ a ").append(getPrefix(TAG_Semangit + "github_organization_join_event")).append(";");
+                    currentTriple.append("\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_organization_joined_at")).append(" \"").append(formatDateTime(nextLine[2])).append("\"^^xsd:dateTime ] ").append(getPrefix(TAG_Semangit + "github_organization_joined_by")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Userprefix) + nextLine[1])).append(";");
+                    currentTriple.append("\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_organization_is_joined")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Userprefix) + nextLine[0])).append(".");
+                    currentTriple.append("\n");
+                    printTriples(currentTriple.toString(), writers);
+                    currentTriple.setLength(0);
+                }
+                else
+                {
+                    currentTriple.append(b64(getPrefix(TAG_Semangit + TAG_Orga_Join_Eventprefix) + idCtr++)).append(" a ").append(getPrefix(TAG_Semangit + "github_organization_join_event")).append(";");
+                    currentTriple.append("\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_organization_joined_at")).append(" \"").append(formatDateTime(nextLine[2])).append("\"^^xsd:dateTime;\n").append(getPrefix(TAG_Semangit + "github_organization_joined_by")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Userprefix) + nextLine[1])).append(";");
+                    currentTriple.append("\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_organization_is_joined")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Userprefix) + nextLine[0])).append(".");
+                    currentTriple.append("\n");
+                    printTriples(currentTriple.toString(), writers);
+                    currentTriple.setLength(0);
+                }
             }
             for(BufferedWriter w : writers)
             {
@@ -993,6 +1235,8 @@ public class Converter implements Runnable {
 
                 if(abbreviated) //abbreviated in previous step. Only need to print object now
                 {
+                    postIncrementCounter(TAG_Semangit + TAG_Commitprefix);
+                    postIncrementCounter(TAG_Semangit + "repository_has_commit");
                     sb.append(b64(getPrefix(TAG_Semangit + TAG_Repoprefix) + curLine[1])); //one commit for multiple repositories (branching / merging)
                 }
                 else //no abbreviation occurred. Full subject predicate object triple printed
@@ -1016,6 +1260,8 @@ public class Converter implements Runnable {
             //handle last line
             if(abbreviated) //abbreviated in previous step. Only need to print object now
             {
+                postIncrementCounter(TAG_Semangit + TAG_Commitprefix);
+                postIncrementCounter(TAG_Semangit + "repository_has_commit");
                 sb.append(b64(getPrefix(TAG_Semangit + TAG_Repoprefix) + curLine[1]) ); //one commit for multiple repositories (branching / merging)
             }
             else //no abbreviation occurred. Full subject predicate object triple printed
@@ -1056,6 +1302,7 @@ public class Converter implements Runnable {
                     }
                 }
             }
+            int idCtr = 0;
 
             String[] nextLine;
 
@@ -1067,15 +1314,28 @@ public class Converter implements Runnable {
                 }
 
 
-                currentTriple.append("[ a " ).append( getPrefix(TAG_Semangit + "github_project_join_event") ).append( ";");
-                currentTriple.append("\n");
-                currentTriple.append(getPrefix(TAG_Semangit + "github_project_join_event_created_at") ).append( " \"" ).append( formatDateTime(nextLine[2]) ).append( "\"^^xsd:dateTime ] ");
-                currentTriple.append(getPrefix(TAG_Semangit + "github_project_joining_user") ).append( " " ).append( b64(getPrefix(TAG_Semangit + TAG_Userprefix) + nextLine[1]) ).append( ";");
-                currentTriple.append("\n");
-                currentTriple.append(getPrefix(TAG_Semangit + "github_project_joined") ).append( " " ).append( b64(getPrefix(TAG_Semangit + TAG_Repoprefix) + nextLine[0]) ).append( ".");
-                currentTriple.append("\n");
-                printTriples(currentTriple.toString(), writers);
-                currentTriple.setLength(0);
+                if(useBlankNodes) {
+                    currentTriple.append("[ a ").append(getPrefix(TAG_Semangit + "github_project_join_event")).append(";");
+                    currentTriple.append("\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_project_join_event_created_at")).append(" \"").append(formatDateTime(nextLine[2])).append("\"^^xsd:dateTime ] ");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_project_joining_user")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Userprefix) + nextLine[1])).append(";");
+                    currentTriple.append("\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_project_joined")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Repoprefix) + nextLine[0])).append(".");
+                    currentTriple.append("\n");
+                    printTriples(currentTriple.toString(), writers);
+                    currentTriple.setLength(0);
+                }
+                else {
+                    currentTriple.append(b64(getPrefix(TAG_Semangit + TAG_Repo_Join_Eventprefix) + idCtr++)).append(" a ").append(getPrefix(TAG_Semangit + "github_project_join_event")).append(";");
+                    currentTriple.append("\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_project_join_event_created_at")).append(" \"").append(formatDateTime(nextLine[2])).append("\"^^xsd:dateTime;\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_project_joining_user")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Userprefix) + nextLine[1])).append(";");
+                    currentTriple.append("\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_project_joined")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Repoprefix) + nextLine[0])).append(".");
+                    currentTriple.append("\n");
+                    printTriples(currentTriple.toString(), writers);
+                    currentTriple.setLength(0);
+                }
             }
             for(BufferedWriter w : writers)
             {
@@ -1204,6 +1464,8 @@ public class Converter implements Runnable {
 
                 if(abbreviated)
                 {
+                    postIncrementCounter(TAG_Semangit + TAG_Commitprefix);
+                    postIncrementCounter(TAG_Semangit + "pull_request_has_commit");
                     currentTriple.append(b64(getPrefix(TAG_Semangit + TAG_Commitprefix) + curLine[1]));
                 }
                 else
@@ -1229,6 +1491,8 @@ public class Converter implements Runnable {
             //handle last line of file
             if(abbreviated)
             {
+                postIncrementCounter(TAG_Semangit + TAG_Commitprefix);
+                postIncrementCounter(TAG_Semangit + "pull_request_has_commit");
                 currentTriple.append(b64(getPrefix(TAG_Semangit + TAG_Commitprefix) + curLine[1]) ).append( ".");
             }
             else
@@ -1262,6 +1526,8 @@ public class Converter implements Runnable {
                 }
             }
 
+            int idCtr = 0;
+
             String[] nextLine;
 
             TableSchema schema = schemata.get("pull_request_history");
@@ -1271,25 +1537,47 @@ public class Converter implements Runnable {
                     continue;
                 }
 
-                currentTriple.append("[ a " ).append( getPrefix(TAG_Semangit + "github_pull_request_action") ).append( ";");
-                currentTriple.append("\n");
-                //id, PR id, created at, action, actor
-                currentTriple.append(getPrefix(TAG_Semangit + "github_pull_request_action_created_at") ).append( " \"" ).append( formatDateTime(nextLine[2]) ).append( "\"^^xsd:dateTime;");
-                currentTriple.append("\n");
-                currentTriple.append(getPrefix(TAG_Semangit + "github_pull_request_action_id") ).append( " " ).append( nextLine[0] ).append( ";");
-                currentTriple.append("\n");
-                currentTriple.append(getPrefix(TAG_Semangit + "github_pull_request_action_type") ).append( " \"" ).append( nextLine[3] ).append( "\" ] ");
-                if(!nextLine[4].equals("N"))
-                {
-                    currentTriple.append(getPrefix(TAG_Semangit + "github_pull_request_actor") ).append( " " ).append( b64(getPrefix(TAG_Semangit + TAG_Userprefix) + nextLine[4]) ).append( ";");
+                if(useBlankNodes) {
+                    currentTriple.append("[ a ").append(getPrefix(TAG_Semangit + "github_pull_request_action")).append(";");
                     currentTriple.append("\n");
+                    //id, PR id, created at, action, actor
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_pull_request_action_created_at")).append(" \"").append(formatDateTime(nextLine[2])).append("\"^^xsd:dateTime;");
+                    currentTriple.append("\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_pull_request_action_id")).append(" ").append(nextLine[0]).append(";");
+                    currentTriple.append("\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_pull_request_action_type")).append(" \"").append(nextLine[3]).append("\" ] ");
+                    if (!nextLine[4].equals("N")) {
+                        currentTriple.append(getPrefix(TAG_Semangit + "github_pull_request_actor")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Userprefix) + nextLine[4])).append(";");
+                        currentTriple.append("\n");
+                    }
+                    if (!nextLine[1].equals("N")) {
+                        //TODO: Need some else part here to not end up with broken triples
+                        currentTriple.append(getPrefix(TAG_Semangit + "github_pull_request_action_pull_request")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Pullrequestprefix) + nextLine[1])).append(".");
+                        currentTriple.append("\n");
+                        printTriples(currentTriple.toString(), writers);
+                        currentTriple.setLength(0);
+                    }
                 }
-                if(!nextLine[1].equals("N")) {
-                    //TODO: Need some else part here to not end up with broken triples
-                    currentTriple.append(getPrefix(TAG_Semangit + "github_pull_request_action_pull_request") ).append( " " ).append( b64(getPrefix(TAG_Semangit + TAG_Pullrequestprefix) + nextLine[1]) ).append( ".");
+                else {
+                    currentTriple.append(b64(getPrefix(TAG_Semangit + TAG_Pullrequest_Actionprefix) + idCtr++)).append(" a ").append(getPrefix(TAG_Semangit + "github_pull_request_action")).append(";");
                     currentTriple.append("\n");
-                    printTriples(currentTriple.toString(), writers);
-                    currentTriple.setLength(0);
+                    //id, PR id, created at, action, actor
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_pull_request_action_created_at")).append(" \"").append(formatDateTime(nextLine[2])).append("\"^^xsd:dateTime;");
+                    currentTriple.append("\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_pull_request_action_id")).append(" ").append(nextLine[0]).append(";");
+                    currentTriple.append("\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_pull_request_action_type")).append(" \"").append(nextLine[3]).append("\";\n");
+                    if (!nextLine[4].equals("N")) {
+                        currentTriple.append(getPrefix(TAG_Semangit + "github_pull_request_actor")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Userprefix) + nextLine[4])).append(";");
+                        currentTriple.append("\n");
+                    }
+                    if (!nextLine[1].equals("N")) {
+                        //TODO: Need some else part here to not end up with broken triples
+                        currentTriple.append(getPrefix(TAG_Semangit + "github_pull_request_action_pull_request")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Pullrequestprefix) + nextLine[1])).append(".");
+                        currentTriple.append("\n");
+                        printTriples(currentTriple.toString(), writers);
+                        currentTriple.setLength(0);
+                    }
                 }
             }
             for(BufferedWriter w : writers)
@@ -1631,6 +1919,8 @@ public class Converter implements Runnable {
                 }
             }
 
+            int idCtr = 0;
+
             String[] nextLine;
 
             TableSchema schema = schemata.get("watchers");
@@ -1640,16 +1930,31 @@ public class Converter implements Runnable {
                     continue;
                 }
 
-                currentTriple.append("[ a " ).append( getPrefix(TAG_Semangit + "github_follow_event") ).append( ";");
-                currentTriple.append("\n");
-                currentTriple.append(getPrefix(TAG_Semangit + "github_following_since") ).append( " \"" ).append( formatDateTime(nextLine[2]) ).append( "\"^^xsd:dateTime;");
-                currentTriple.append("\n");
-                currentTriple.append(getPrefix(TAG_Semangit + "github_user_or_project") ).append( " true ] " ).append( getPrefix(TAG_Semangit + "github_follower") ).append( " " ).append( b64(getPrefix(TAG_Semangit  + TAG_Userprefix) + nextLine[1]) ).append( ";");
-                currentTriple.append("\n");
-                currentTriple.append(getPrefix(TAG_Semangit + "github_follows") ).append( " " ).append( b64(getPrefix(TAG_Semangit  + TAG_Repoprefix) + nextLine[0]) ).append( ".");
-                currentTriple.append("\n");
-                printTriples(currentTriple.toString(), writers);
-                currentTriple.setLength(0);
+                if(useBlankNodes) {
+                    currentTriple.append("[ a ").append(getPrefix(TAG_Semangit + "github_follow_event")).append(";");
+                    currentTriple.append("\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_following_since")).append(" \"").append(formatDateTime(nextLine[2])).append("\"^^xsd:dateTime;");
+                    currentTriple.append("\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_user_or_project")).append(" true ] ").append(getPrefix(TAG_Semangit + "github_follower")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Userprefix) + nextLine[1])).append(";");
+                    currentTriple.append("\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_follows")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Repoprefix) + nextLine[0])).append(".");
+                    currentTriple.append("\n");
+                    printTriples(currentTriple.toString(), writers);
+                    currentTriple.setLength(0);
+                }
+                else
+                {
+                    currentTriple.append(b64(getPrefix(TAG_Semangit + TAG_Watcherprefix) + idCtr++)).append(" a ").append(getPrefix(TAG_Semangit + "github_follow_event")).append(";");
+                    currentTriple.append("\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_following_since")).append(" \"").append(formatDateTime(nextLine[2])).append("\"^^xsd:dateTime;");
+                    currentTriple.append("\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_user_or_project")).append(" true;\n").append(getPrefix(TAG_Semangit + "github_follower")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Userprefix) + nextLine[1])).append(";");
+                    currentTriple.append("\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_follows")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Repoprefix) + nextLine[0])).append(".");
+                    currentTriple.append("\n");
+                    printTriples(currentTriple.toString(), writers);
+                    currentTriple.setLength(0);
+                }
             }
             for(BufferedWriter w : writers)
             {
@@ -1687,6 +1992,7 @@ public class Converter implements Runnable {
             String[] nextLine;
             Map<String, Integer> languages = new HashMap<>();
             int langCtr = 0;
+            int idCtr = 0;
             int currentLang;
 
             TableSchema schema = schemata.get("project_languages");
@@ -1709,17 +2015,34 @@ public class Converter implements Runnable {
                     currentTriple.append("\n");
                     currentLang = langCtr;
                 }
-                currentTriple.append("[ a " ).append( getPrefix(TAG_Semangit + "github_project_language") ).append( ";");
-                currentTriple.append("\n");
-                //bytes, timestamp, then close brackets and do remaining two links
-                currentTriple.append(getPrefix(TAG_Semangit + "github_project_language_bytes") ).append( " " ).append( nextLine[2] ).append( ";");
-                currentTriple.append("\n");
-                currentTriple.append(getPrefix(TAG_Semangit + "github_project_language_timestamp") ).append( " \"" ).append( formatDateTime(nextLine[3]) ).append( "\"^^xsd:dateTime ] " ).append( getPrefix(TAG_Semangit + "github_project_language_repo") ).append( " " ).append( b64(getPrefix(TAG_Semangit + TAG_Repoprefix) + nextLine[0]) ).append( ";");
-                currentTriple.append("\n");
-                currentTriple.append(getPrefix(TAG_Semangit + "github_project_language_is") ).append( " " ).append( b64(getPrefix(TAG_Semangit + TAG_Langprefix) + currentLang) ).append( ".");
-                currentTriple.append("\n");
-                printTriples(currentTriple.toString(), writers);
-                currentTriple.setLength(0);
+                if(useBlankNodes) {
+                    currentTriple.append("[ a ").append(getPrefix(TAG_Semangit + "github_project_language")).append(";");
+                    currentTriple.append("\n");
+                    //bytes, timestamp, then close brackets and do remaining two links
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_project_language_bytes")).append(" ").append(nextLine[2]).append(";");
+                    currentTriple.append("\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_project_language_timestamp")).append(" \"").append(formatDateTime(nextLine[3])).append("\"^^xsd:dateTime ] ").append(getPrefix(TAG_Semangit + "github_project_language_repo")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Repoprefix) + nextLine[0])).append(";");
+                    currentTriple.append("\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_project_language_is")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Langprefix) + currentLang)).append(".");
+                    currentTriple.append("\n");
+                    printTriples(currentTriple.toString(), writers);
+                    currentTriple.setLength(0);
+                }
+                else
+                {
+                    currentTriple.append(b64(getPrefix(TAG_Semangit + TAG_Repolangprefix) + idCtr++)).append(" a ").append(getPrefix(TAG_Semangit + "github_project_language")).append(";");
+                    currentTriple.append("\n");
+                    //bytes, timestamp, then close brackets and do remaining two links
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_project_language_bytes")).append(" ").append(nextLine[2]).append(";");
+                    currentTriple.append("\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_project_language_timestamp")).append(" \"").append(formatDateTime(nextLine[3])).append("\"^^xsd:dateTime;\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_project_language_repo")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Repoprefix) + nextLine[0])).append(";");
+                    currentTriple.append("\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "github_project_language_is")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Langprefix) + currentLang)).append(".");
+                    currentTriple.append("\n");
+                    printTriples(currentTriple.toString(), writers);
+                    currentTriple.setLength(0);
+                }
             }
             for(BufferedWriter w : writers)
             {
@@ -1858,6 +2181,7 @@ public class Converter implements Runnable {
                 }
             }
 
+            int idCtr = 0;
             String[] nextLine;
 
             TableSchema schema = schemata.get("issue_comments");
@@ -1868,25 +2192,39 @@ public class Converter implements Runnable {
                 }
 
 
-                //TODO: Let's verify the integrity of the RDF output of this
-                currentTriple.append("[" ).append( getPrefix(TAG_Semangit + "comment_for") ).append( " " ).append( b64(getPrefix(TAG_Semangit + TAG_Issueprefix) + nextLine[0]) ).append( ";"); //comment for an issue
-                currentTriple.append("\n");
-
-                currentTriple.append(getPrefix(TAG_Semangit + "comment_created_at") ).append( " \"" ).append( nextLine[3] ).append( "\";");
-                currentTriple.append("\n");
-
-                if(!nextLine[1].equals("") && !nextLine[1].equals("N")) {
-                    currentTriple.append(getPrefix(TAG_Semangit + "comment_author") ).append( " " ).append( b64(getPrefix(TAG_Semangit + TAG_Userprefix) + nextLine[1]) ).append( "] a " ).append( getPrefix(TAG_Semangit + "comment") ).append( ".");
+                if(useBlankNodes) {
+                    //TODO: Let's verify the integrity of the RDF output of this
+                    currentTriple.append("[").append(getPrefix(TAG_Semangit + "comment_for")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Issueprefix) + nextLine[0])).append(";"); //comment for an issue
                     currentTriple.append("\n");
+
+                    currentTriple.append(getPrefix(TAG_Semangit + "comment_created_at")).append(" \"").append(nextLine[3]).append("\";"); //TODO: ^^xsd_date stuff
+                    currentTriple.append("\n");
+
+                    if (!nextLine[1].equals("") && !nextLine[1].equals("N")) {
+                        currentTriple.append(getPrefix(TAG_Semangit + "comment_author")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Userprefix) + nextLine[1])).append("] a ").append(getPrefix(TAG_Semangit + "comment")).append(".");
+                        currentTriple.append("\n");
+                    } else {
+                        System.out.println("Warning! Invalid user found in parseIssueComments. Using MAX_INT as userID.");
+                        currentTriple.append(getPrefix(TAG_Semangit + "comment_author")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Userprefix) + Integer.MAX_VALUE)).append("] a ").append(getPrefix(TAG_Semangit + "comment")).append("."); //TODO Double check this line
+                        currentTriple.append("\n");
+                    }
+                    printTriples(currentTriple.toString(), writers);
+                    currentTriple.setLength(0);
                 }
                 else
                 {
-                    System.out.println("Warning! Invalid user found in parseIssueComments. Using MAX_INT as userID.");
-                    currentTriple.append(getPrefix(TAG_Semangit + "comment_author") ).append( " " ).append( b64(getPrefix(TAG_Semangit + TAG_Userprefix) + Integer.MAX_VALUE )).append( "] a " ).append( getPrefix(TAG_Semangit + "comment") ).append( "."); //TODO Double check this line
+                    currentTriple.append(b64(getPrefix(TAG_Semangit + TAG_Issue_Commentprefix) + idCtr++)).append(" a ").append(getPrefix(TAG_Semangit + "comment")).append(";\n");
+                    currentTriple.append(getPrefix(TAG_Semangit + "comment_for")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Issueprefix) + nextLine[0])).append(";"); //comment for an issue
                     currentTriple.append("\n");
+
+                    currentTriple.append(getPrefix(TAG_Semangit + "comment_created_at")).append(" \"").append(nextLine[3]).append("\";"); //TODO: ^^xsd_date stuff
+                    currentTriple.append("\n");
+
+                    currentTriple.append(getPrefix(TAG_Semangit + "comment_author")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Userprefix) + nextLine[1])).append(".");
+                    currentTriple.append("\n");
+                    printTriples(currentTriple.toString(), writers);
+                    currentTriple.setLength(0);
                 }
-                printTriples(currentTriple.toString(), writers);
-                currentTriple.setLength(0);
             }
             for(BufferedWriter w : writers)
             {
@@ -1916,6 +2254,8 @@ public class Converter implements Runnable {
                     }
                 }
             }
+
+            int idCtr = 0;
 
             String[] nextLine;
 
@@ -1950,47 +2290,91 @@ public class Converter implements Runnable {
                 for (int i = 0; i < nextLine.length; i++) {
                     nextLine[i] = groovy.json.StringEscapeUtils.escapeJava(nextLine[i]);
                 }
-                //TODO: Let's verify the integrity of the RDF output of this
-                if(!nextLine[0].equals("")) {
-                    currentTriple.append("[" ).append( getPrefix(TAG_Semangit + "comment_for") ).append( " " ).append( b64(getPrefix(TAG_Semangit + TAG_Pullrequestprefix) + nextLine[0])); //comment for a pull request
-                    currentTriple.append(",");
-                    currentTriple.append("\n");
-                }
-                else
-                {
-                    currentTriple.append("[" ).append( getPrefix(TAG_Semangit + "comment_for") ).append( " ");
-                }
-                if(!nextLine[5].equals("") && !nextLine[5].equals("N")) {
-                    currentTriple.append(b64(getPrefix(TAG_Semangit + TAG_Commitprefix) + nextLine[5]) ).append( ";");
-                    currentTriple.append("\n");
-                }
-                if(!nextLine[6].equals("") && !nextLine[6].equals("N")) {
-                    currentTriple.append(getPrefix(TAG_Semangit + "comment_created_at") ).append( " \"" ).append( nextLine[6] ).append( "\";");
-                    currentTriple.append("\n");
-                }
-                if(!nextLine[3].equals("") && !nextLine[3].equals("N")) {
-                    currentTriple.append(getPrefix(TAG_Semangit + "comment_pos") ).append( " " ).append( nextLine[3] ).append( ";");
-                    currentTriple.append("\n");
-                }
-                if(!noUserTexts) {
-                    if (!nextLine[4].equals("") && !nextLine[4].equals("N")) {
 
-                        currentTriple.append(getPrefix(TAG_Semangit + "comment_body")).append(" \"").append(nextLine[4]).append("\";");
+                if(useBlankNodes) {
+                    //TODO: Let's verify the integrity of the RDF output of this
+                    if (!nextLine[0].equals("")) {
+                        currentTriple.append("[").append(getPrefix(TAG_Semangit + "comment_for")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Pullrequestprefix) + nextLine[0])); //comment for a pull request
+                        if (!nextLine[5].equals("") && !nextLine[5].equals("N")) {
+                            currentTriple.append(",\n").append(getPrefix(TAG_Semangit + "comment_for")).append(" ");
+                        }
+                        else {
+                            currentTriple.append(";\n");
+                        }
+                    }
+                    if (!nextLine[5].equals("") && !nextLine[5].equals("N")) {
+                        currentTriple.append(b64(getPrefix(TAG_Semangit + TAG_Commitprefix) + nextLine[5])).append(";");
                         currentTriple.append("\n");
                     }
-                }
-                if(!nextLine[1].equals("") && !nextLine[1].equals("N")) {
-                    currentTriple.append(getPrefix(TAG_Semangit + "comment_author") ).append( " " ).append( b64(getPrefix(TAG_Semangit + TAG_Userprefix) + nextLine[1]) ).append( "] a " ).append( getPrefix(TAG_Semangit + "comment") ).append( ".");
-                    currentTriple.append("\n");
+                    if (!nextLine[6].equals("") && !nextLine[6].equals("N")) {
+                        currentTriple.append(getPrefix(TAG_Semangit + "comment_created_at")).append(" \"").append(nextLine[6]).append("\";"); //TODO ^^xsd:date stuff
+                        currentTriple.append("\n");
+                    }
+                    if (!nextLine[3].equals("") && !nextLine[3].equals("N")) {
+                        currentTriple.append(getPrefix(TAG_Semangit + "comment_pos")).append(" ").append(nextLine[3]).append(";");
+                        currentTriple.append("\n");
+                    }
+                    if (!noUserTexts) {
+                        if (!nextLine[4].equals("") && !nextLine[4].equals("N")) {
+
+                            currentTriple.append(getPrefix(TAG_Semangit + "comment_body")).append(" \"").append(nextLine[4]).append("\";");
+                            currentTriple.append("\n");
+                        }
+                    }
+                    if (!nextLine[1].equals("") && !nextLine[1].equals("N")) {
+                        currentTriple.append(getPrefix(TAG_Semangit + "comment_author")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Userprefix) + nextLine[1])).append("] a ").append(getPrefix(TAG_Semangit + "comment")).append(".");
+                        currentTriple.append("\n");
+                    } else {
+                        System.out.println("Warning! Invalid user found in parsePullRequestComments. Using MAX_INT as userID.");
+                        currentTriple.append(getPrefix(TAG_Semangit + "comment_author")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Userprefix) + Integer.MAX_VALUE)).append("] a ").append(getPrefix(TAG_Semangit + "comment")).append("."); //TODO: Also check this line
+                        currentTriple.append("\n");
+                    }
+                    printTriples(currentTriple.toString(), writers);
+                    currentTriple.setLength(0);
                 }
                 else
                 {
-                    System.out.println("Warning! Invalid user found in parsePullRequestComments. Using MAX_INT as userID.");
-                    currentTriple.append(getPrefix(TAG_Semangit + "comment_author") ).append( " " ).append( b64(getPrefix(TAG_Semangit + TAG_Userprefix) + Integer.MAX_VALUE )).append( "] a " ).append( getPrefix(TAG_Semangit + "comment") ).append( "."); //TODO: Also check this line
-                    currentTriple.append("\n");
+                    currentTriple.append(b64(getPrefix(TAG_Semangit + TAG_Pullrequest_Commentprefix) + idCtr++)).append(" a ").append(getPrefix(TAG_Semangit + "comment")).append(";\n");
+                    if (!nextLine[0].equals("")) {
+                        currentTriple.append(getPrefix(TAG_Semangit + "comment_for")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Pullrequestprefix) + nextLine[0])); //comment for a pull request
+                        if (!nextLine[5].equals("") && !nextLine[5].equals("N")) {
+                            currentTriple.append(",\n").append(getPrefix(TAG_Semangit + "comment_for")).append(" ");
+                        }
+                        else {
+                            currentTriple.append(";\n");
+                        }
+                    }
+                    if (!nextLine[5].equals("") && !nextLine[5].equals("N")) {
+                        currentTriple.append(b64(getPrefix(TAG_Semangit + TAG_Commitprefix) + nextLine[5])).append(";");
+                        currentTriple.append("\n");
+                    }
+                    if (!nextLine[6].equals("") && !nextLine[6].equals("N")) {
+                        currentTriple.append(getPrefix(TAG_Semangit + "comment_created_at")).append(" \"").append(nextLine[6]).append("\";"); //TODO ^^xsd:date stuff
+                        currentTriple.append("\n");
+                    }
+                    if (!nextLine[3].equals("") && !nextLine[3].equals("N")) {
+                        currentTriple.append(getPrefix(TAG_Semangit + "comment_pos")).append(" ").append(nextLine[3]).append(";");
+                        currentTriple.append("\n");
+                    }
+                    if (!noUserTexts) {
+                        if (!nextLine[4].equals("") && !nextLine[4].equals("N")) {
+
+                            currentTriple.append(getPrefix(TAG_Semangit + "comment_body")).append(" \"").append(nextLine[4]).append("\";");
+                            currentTriple.append("\n");
+                        }
+                    }
+                    if (!nextLine[1].equals("") && !nextLine[1].equals("N")) {
+                        currentTriple.append(getPrefix(TAG_Semangit + "comment_author")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Userprefix) + nextLine[1])).append(" .");
+                        currentTriple.append("\n");
+                    } else {
+                        System.out.println("Warning! Invalid user found in parsePullRequestComments. Using MAX_INT as userID.");
+                        currentTriple.append(getPrefix(TAG_Semangit + "comment_author")).append(" ").append(b64(getPrefix(TAG_Semangit + TAG_Userprefix) + Integer.MAX_VALUE)).append("] a ").append(getPrefix(TAG_Semangit + "comment")).append("."); //TODO: Also check this line
+                        currentTriple.append("\n");
+                    }
+                    printTriples(currentTriple.toString(), writers);
+                    currentTriple.setLength(0);
+
                 }
-                printTriples(currentTriple.toString(), writers);
-                currentTriple.setLength(0);
             }
             for(BufferedWriter w : writers)
             {
@@ -2005,9 +2389,10 @@ public class Converter implements Runnable {
     }
 
 
-/*
-    private static ArrayList<String> extractConnectedEntities(ArrayList<String> inputTriple)
+    //TODO: Figgure out some way to check if this is the bottle neck when handling projects with 100k+ commmits... BIG ISSUE
+    private static ArrayList<String> extractConnectedEntities(String inputTripleString)
     {
+        String[] inputTriple = inputTripleString.split("\n");
         ArrayList<String> output = new ArrayList<>();
         for (String s : inputTriple)
         {
@@ -2050,7 +2435,7 @@ public class Converter implements Runnable {
         }
         return output;
     }
-*/
+
 
     /*
     private static String entityToIdentifier(String entity)
@@ -2287,7 +2672,7 @@ public class Converter implements Runnable {
             w.newLine();
             //w.write("@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .");
             //w.newLine();
-            w.write("@prefix waiver: <http://vocab.org/waiver/terms/norms> .");
+            w.write("@prefix wv: <http://vocab.org/waiver/terms/norms> .");
             w.newLine();
             //w.write("@prefix sd: <http://www.w3.org/ns/sparql-service-description#> .");
             //w.newLine();
@@ -2335,9 +2720,9 @@ public class Converter implements Runnable {
             /*
             w.write("dcterms:license <>;");
             w.newLine();
-            w.write("waiver:norms <>;");
+            w.write("wv:norms <>;");
             w.newLine();
-            w.write("waiver:waiver <>;");
+            w.write("wv:waiver <>;");
             w.newLine();
             */
 
@@ -2525,6 +2910,8 @@ public class Converter implements Runnable {
 
     public static void main(String[] args)
     {
+        long startTime = System.currentTimeMillis();
+
         if(args.length > 1)
         {
             boolean percentageGiven = false;
@@ -2532,6 +2919,7 @@ public class Converter implements Runnable {
             //mode, prefixing
             for(String s: args)
             {
+                s = s.toLowerCase();
                 if(s.equals("-noprefix"))
                 {
                     System.out.println("Prefixing disabled! Large output expected...");
@@ -2612,20 +3000,41 @@ public class Converter implements Runnable {
                         System.exit(1);
                     }
                 }
-                else if(s.toLowerCase().contains("-nomerging"))
+                else if(s.contains("-nomerging"))
                 {
                     mergeOutput = false;
                 }
-                else if(s.toLowerCase().contains("-nostrings"))
+                else if(s.contains("-nostrings"))
                 {
                     noUserTexts = true;
                 }
+                else if(s.contains("-noblank"))
+                {
+                    useBlankNodes = false;
+                    //TODO to be documented
+                }
+                else if(s.contains("-cassandra"))
+                {
+                    try
+                    {
+                        cluster = Cluster.builder().addContactPoint("127.0.0.1").withClusterName("SemanGit Cluster").build();
+                        session = cluster.connect();
+                        //ResultSet rs = session.execute("select release_version from system.local");
+                        //Row row = rs.one();
+                        //System.out.println(row.getString("release_version"));
+                    }
+                    catch (Exception e)
+                    {
+                        e.printStackTrace();
+                        System.exit(1);
+                    }
+                }
                 else
                 {
-                    if(!s.equals(args[0]))
+                    if(!s.equals(args[0].toLowerCase()))
                     {
                         System.out.println("Unknown parameter: " + s);
-                        System.out.println("Usage: java -cp com.semangit_main.jar Mainass <path/to/input/directory> [-base=64|32|16|10] [-noprefix] [-sampling=random] [-percentage=X] [-nomerging] [-nostrings]");
+                        System.out.println("Usage: java -jar converter_main.jar <path/to/input/directory> [-base=64|32|16|10] [-noprefix] [-sampling=random] [-percentage=X] [-nomerging] [-nostrings]");
                         System.out.println("Note that percentage parameter is obligatory, if sampling method is set to random. Otherwise it will be ignored.");
                     }
                 }
@@ -2654,7 +3063,7 @@ public class Converter implements Runnable {
             }
         }
         try {
-            numTriples = new AtomicInteger(0);
+            numTriples = new AtomicInteger(0); //TODO: Make into AtomicLong
             File index = new File(args[0] + "rdf");
             if (!index.exists() && !index.mkdirs()) {
                 System.out.println("Unable to create " + args[0] + "rdf/ directory. Exiting.");
@@ -2663,6 +3072,8 @@ public class Converter implements Runnable {
             rdfPath = args[0] + "rdf/";
             initPrefixTable();
             parseSQLSchema(args[0]);
+
+
 
             System.out.println();
 
@@ -2775,6 +3186,7 @@ public class Converter implements Runnable {
         if(errorCtr != 0)
         {
             System.out.println("A total of " + errorCtr + " errors occurred.");
+            System.out.println("Time taken: " + (System.currentTimeMillis() - startTime) / 1000 + "s");
             System.exit(2);
         }
 
@@ -2803,12 +3215,13 @@ public class Converter implements Runnable {
                 }
             }
             System.out.println("Now printing statistics for prefix usage for further optimization.");
-            final Set<Map.Entry<String, Integer>> prefixCtrs = prefixCtr.entrySet();
-            for (Map.Entry<String, Integer> entry : prefixCtrs) {
+            final Set<Map.Entry<String, Long>> prefixCtrs = prefixCtr.entrySet();
+            for (Map.Entry<String, Long> entry : prefixCtrs) {
                 System.out.println("URI: " + entry.getKey() + " -- Used Prefix: " + prefixTable.get(entry.getKey()) + " -- Counter: " + entry.getValue());
             }
+            System.out.println("Num triples: " + numTriples.get());
         }
-        //System.out.println("Num triples: " + numTriples.get());
+        System.out.println("Time taken: " + (System.currentTimeMillis() - startTime) / 1000 + "s");
         System.exit(0);
 
     }

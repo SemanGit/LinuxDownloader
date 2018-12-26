@@ -5,6 +5,7 @@ help=false
 skip_install=false
 keep_data=false
 output_dir=$(pwd)
+
 jar_location=$(pwd)/Converter/out/artifacts/converter_main_jar/converter_main.jar
 
 clear
