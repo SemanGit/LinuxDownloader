@@ -22,4 +22,4 @@ Options include:
 - **-skip_install** - skips the depencency checks and the installation of packages. 
 - **-keep_everything** - keeps the output of all intermediate steps (4-7). (Attention: This results in a huge storage overhead)
 - **-output_dir=<absolute_path>** - change the storage location for all steps and the final output
-- **-converter_options=&quot; -option1 -option2 ... &quot; ** - passes options to the converter. A list of available options can be found in the folder Converter
+- **-converter_options=&quot;-option1 -option2 ... &quot;** - passes options to the converter. A list of available options can be found in the folder Converter
