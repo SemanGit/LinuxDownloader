@@ -5,7 +5,8 @@ help=false
 skip_install=false
 keep_data=false
 output_dir=$(pwd)
-jar_loc=$(pwd)/Converter/out/artifacts/converter_main_jar/converter_main.jar
+
+jar_location=$(pwd)/Converter/out/artifacts/converter_main_jar/converter_main.jar
 
 clear
 
@@ -328,7 +329,7 @@ else
 					timestamp=`date "+%Y_%m_%d_%H_%M_%S"`
 					echo "$timestamp --- Starting Conversion" >> $log
 					for d in */ ; do
-						java -jar "$jar_loc" "$d" -debug >> $log 2>&1 ; java_exit_code=$? 
+						java -jar "$jar_location" "$d" -debug >> $log 2>&1 ; java_exit_code=$? 
 					done
 					if [ "$java_exit_code" == "0" ]; then 
 						timestamp=`date "+%Y_%m_%d_%H_%M_%S"`
