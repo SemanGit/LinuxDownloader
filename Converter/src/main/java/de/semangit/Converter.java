@@ -1,5 +1,8 @@
 package de.semangit;
 
+//TODO: Add some versioning output to the jar file, e.g. build date from manifest, see https://stackoverflow.com/questions/3336392/java-print-time-of-last-compilation
+
+
 //import com.datastax.driver.core.*;
 import com.datastax.driver.core.*;
 import com.opencsv.CSVReader;
